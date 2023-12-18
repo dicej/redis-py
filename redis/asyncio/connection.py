@@ -3,7 +3,6 @@ import copy
 import enum
 import inspect
 import socket
-import ssl
 import sys
 import warnings
 import weakref
@@ -24,6 +23,16 @@ from typing import (
     Union,
 )
 from urllib.parse import ParseResult, parse_qs, unquote, urlparse
+
+from ..utils import SSL_AVAILABLE
+
+if SSL_AVAILABLE:
+    import ssl
+    from ssl import SSLContext
+
+else:
+    ssl = None
+    SSLContext = None
 
 # the functionality is available in 3.11.x but has a major issue before
 # 3.11.3. See https://github.com/redis/redis-py/issues/2633
@@ -740,6 +749,9 @@ class SSLConnection(Connection):
         ssl_check_hostname: bool = False,
         **kwargs,
     ):
+        if not SSL_AVAILABLE:
+            raise RedisError("Python wasn't built with SSL support")
+
         self.ssl_context: RedisSSLContext = RedisSSLContext(
             keyfile=ssl_keyfile,
             certfile=ssl_certfile,
@@ -800,6 +812,9 @@ class RedisSSLContext:
         ca_data: Optional[str] = None,
         check_hostname: bool = False,
     ):
+        if not SSL_AVAILABLE:
+            raise RedisError("Python wasn't built with SSL support")
+
         self.keyfile = keyfile
         self.certfile = certfile
         if cert_reqs is None:
@@ -820,7 +835,7 @@ class RedisSSLContext:
         self.check_hostname = check_hostname
         self.context: Optional[ssl.SSLContext] = None
 
-    def get(self) -> ssl.SSLContext:
+    def get(self) -> SSLContext:
         if not self.context:
             context = ssl.create_default_context()
             context.check_hostname = self.check_hostname
