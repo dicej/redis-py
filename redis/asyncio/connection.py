@@ -30,11 +30,12 @@ from ..utils import SSL_AVAILABLE
 
 if SSL_AVAILABLE:
     import ssl
-    from ssl import SSLContext
+    from ssl import SSLContext, TLSVersion
 
 else:
     ssl = None
     SSLContext = None
+    TLSVersion = None
 
 # the functionality is available in 3.11.x but has a major issue before
 # 3.11.3. See https://github.com/redis/redis-py/issues/2633
@@ -832,7 +833,7 @@ class SSLConnection(Connection):
         ssl_ca_certs: Optional[str] = None,
         ssl_ca_data: Optional[str] = None,
         ssl_check_hostname: bool = False,
-        ssl_min_version: Optional[ssl.TLSVersion] = None,
+        ssl_min_version: Optional[TLSVersion] = None,
         **kwargs,
     ):
         if not SSL_AVAILABLE:
@@ -903,7 +904,7 @@ class RedisSSLContext:
         ca_certs: Optional[str] = None,
         ca_data: Optional[str] = None,
         check_hostname: bool = False,
-        min_version: Optional[ssl.TLSVersion] = None,
+        min_version: Optional[TLSVersion] = None,
     ):
         if not SSL_AVAILABLE:
             raise RedisError("Python wasn't built with SSL support")
@@ -927,7 +928,7 @@ class RedisSSLContext:
         self.ca_data = ca_data
         self.check_hostname = check_hostname
         self.min_version = min_version
-        self.context: Optional[ssl.SSLContext] = None
+        self.context: Optional[SSLContext] = None
 
     def get(self) -> SSLContext:
         if not self.context:

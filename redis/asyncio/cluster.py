@@ -2,7 +2,6 @@ import asyncio
 import collections
 import random
 import socket
-import ssl
 import warnings
 from typing import (
     Any,
@@ -70,12 +69,20 @@ from redis.exceptions import (
 )
 from redis.typing import AnyKeyT, EncodableT, KeyT
 from redis.utils import (
+    SSL_AVAILABLE,
     deprecated_function,
     dict_merge,
     get_lib_version,
     safe_str,
     str_if_bytes,
 )
+
+if SSL_AVAILABLE:
+    import ssl
+    from ssl import TLSVersion
+else:
+    ssl = None
+    TLSVersion = None
 
 TargetNodesT = TypeVar(
     "TargetNodesT", str, "ClusterNode", List["ClusterNode"], Dict[Any, "ClusterNode"]
@@ -272,7 +279,7 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
         ssl_certfile: Optional[str] = None,
         ssl_check_hostname: bool = False,
         ssl_keyfile: Optional[str] = None,
-        ssl_min_version: Optional[ssl.TLSVersion] = None,
+        ssl_min_version: Optional[TLSVersion] = None,
         protocol: Optional[int] = 2,
         address_remap: Optional[Callable[[str, int], Tuple[str, int]]] = None,
         cache_enabled: bool = False,
