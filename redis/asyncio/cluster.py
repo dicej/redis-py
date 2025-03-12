@@ -2,7 +2,6 @@ import asyncio
 import collections
 import random
 import socket
-import ssl
 import warnings
 from typing import (
     Any,
@@ -65,6 +64,9 @@ from redis.exceptions import (
 )
 from redis.typing import AnyKeyT, EncodableT, KeyT
 from redis.utils import deprecated_function, get_lib_version, safe_str, str_if_bytes
+
+if TYPE_CHECKING:
+    import ssl
 
 TargetNodesT = TypeVar(
     "TargetNodesT", str, "ClusterNode", List["ClusterNode"], Dict[Any, "ClusterNode"]

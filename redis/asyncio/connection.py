@@ -3,7 +3,6 @@ import copy
 import enum
 import inspect
 import socket
-import ssl
 import sys
 import warnings
 import weakref
@@ -11,6 +10,7 @@ from abc import abstractmethod
 from itertools import chain
 from types import MappingProxyType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Iterable,
@@ -26,6 +26,11 @@ from typing import (
     Union,
 )
 from urllib.parse import ParseResult, parse_qs, unquote, urlparse
+
+from ..utils import SSL_AVAILABLE
+
+if TYPE_CHECKING:
+    import ssl
 
 from ..auth.token import TokenInterface
 from ..event import AsyncAfterConnectionReleasedEvent, EventDispatcher
@@ -767,6 +772,9 @@ class SSLConnection(Connection):
         ssl_ciphers: Optional[str] = None,
         **kwargs,
     ):
+        if not SSL_AVAILABLE:
+            raise RedisError("Python wasn't built with SSL support")
+
         self.ssl_context: RedisSSLContext = RedisSSLContext(
             keyfile=ssl_keyfile,
             certfile=ssl_certfile,
@@ -837,6 +845,9 @@ class RedisSSLContext:
         min_version: Optional[ssl.TLSVersion] = None,
         ciphers: Optional[str] = None,
     ):
+        if not SSL_AVAILABLE:
+            raise RedisError("Python wasn't built with SSL support")
+
         self.keyfile = keyfile
         self.certfile = certfile
         if cert_reqs is None:
@@ -857,7 +868,7 @@ class RedisSSLContext:
         self.check_hostname = check_hostname
         self.min_version = min_version
         self.ciphers = ciphers
-        self.context: Optional[ssl.SSLContext] = None
+        self.context: Optional[SSLContext] = None
 
     def get(self) -> ssl.SSLContext:
         if not self.context:

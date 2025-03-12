@@ -2,7 +2,6 @@ import asyncio
 import copy
 import inspect
 import re
-import ssl
 import warnings
 from typing import (
     TYPE_CHECKING,
@@ -78,6 +77,9 @@ from redis.utils import (
     safe_str,
     str_if_bytes,
 )
+
+if TYPE_CHECKING:
+    import ssl
 
 PubSubHandler = Callable[[Dict[str, str]], Awaitable[None]]
 _KeyT = TypeVar("_KeyT", bound=KeyT)
