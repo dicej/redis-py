@@ -15,9 +15,11 @@ from typing import (
     Mapping,
     MutableMapping,
     Optional,
+    Protocol,
     Set,
     Tuple,
     Type,
+    TypedDict,
     TypeVar,
     Union,
     cast,
@@ -49,8 +51,14 @@ from redis.commands import (
     AsyncSentinelCommands,
     list_or_args,
 )
-from redis.compat import Protocol, TypedDict
 from redis.credentials import CredentialProvider
+from redis.event import (
+    AfterPooledConnectionsInstantiationEvent,
+    AfterPubSubConnectionInstantiationEvent,
+    AfterSingleConnectionInstantiationEvent,
+    ClientType,
+    EventDispatcher,
+)
 from redis.exceptions import (
     ConnectionError,
     ExecAbortError,
@@ -63,12 +71,18 @@ from redis.exceptions import (
 from redis.typing import ChannelT, EncodableT, KeyT
 from redis.utils import (
     HIREDIS_AVAILABLE,
+    SSL_AVAILABLE,
     _set_info_logger,
     deprecated_function,
     get_lib_version,
     safe_str,
     str_if_bytes,
 )
+
+if TYPE_CHECKING and SSL_AVAILABLE:
+    from ssl import TLSVersion
+else:
+    TLSVersion = None
 
 PubSubHandler = Callable[[Dict[str, str]], Awaitable[None]]
 _KeyT = TypeVar("_KeyT", bound=KeyT)
@@ -80,13 +94,11 @@ if TYPE_CHECKING:
 
 
 class ResponseCallbackProtocol(Protocol):
-    def __call__(self, response: Any, **kwargs):
-        ...
+    def __call__(self, response: Any, **kwargs): ...
 
 
 class AsyncResponseCallbackProtocol(Protocol):
-    async def __call__(self, response: Any, **kwargs):
-        ...
+    async def __call__(self, response: Any, **kwargs): ...
 
 
 ResponseCallbackT = Union[ResponseCallbackProtocol, AsyncResponseCallbackProtocol]
@@ -219,6 +231,8 @@ class Redis(
         ssl_ca_certs: Optional[str] = None,
         ssl_ca_data: Optional[str] = None,
         ssl_check_hostname: bool = False,
+        ssl_min_version: Optional[TLSVersion] = None,
+        ssl_ciphers: Optional[str] = None,
         max_connections: Optional[int] = None,
         single_connection_client: bool = False,
         health_check_interval: int = 0,
@@ -231,6 +245,7 @@ class Redis(
         redis_connect_func=None,
         credential_provider: Optional[CredentialProvider] = None,
         protocol: Optional[int] = 2,
+        event_dispatcher: Optional[EventDispatcher] = None,
     ):
         """
         Initialize a new Redis client.
@@ -240,6 +255,10 @@ class Redis(
         To retry on TimeoutError, `retry_on_timeout` can also be set to `True`.
         """
         kwargs: Dict[str, Any]
+        if event_dispatcher is None:
+            self._event_dispatcher = EventDispatcher()
+        else:
+            self._event_dispatcher = event_dispatcher
         # auto_close_connection_pool only has an effect if connection_pool is
         # None. It is assumed that if connection_pool is not None, the user
         # wants to manage the connection pool themselves.
@@ -311,14 +330,26 @@ class Redis(
                             "ssl_ca_certs": ssl_ca_certs,
                             "ssl_ca_data": ssl_ca_data,
                             "ssl_check_hostname": ssl_check_hostname,
+                            "ssl_min_version": ssl_min_version,
+                            "ssl_ciphers": ssl_ciphers,
                         }
                     )
             # This arg only used if no pool is passed in
             self.auto_close_connection_pool = auto_close_connection_pool
             connection_pool = ConnectionPool(**kwargs)
+            self._event_dispatcher.dispatch(
+                AfterPooledConnectionsInstantiationEvent(
+                    [connection_pool], ClientType.ASYNC, credential_provider
+                )
+            )
         else:
             # If a pool is passed in, do not close it
             self.auto_close_connection_pool = False
+            self._event_dispatcher.dispatch(
+                AfterPooledConnectionsInstantiationEvent(
+                    [connection_pool], ClientType.ASYNC, credential_provider
+                )
+            )
 
         self.connection_pool = connection_pool
         self.single_connection_client = single_connection_client
@@ -349,7 +380,13 @@ class Redis(
         if self.single_connection_client:
             async with self._single_conn_lock:
                 if self.connection is None:
-                    self.connection = await self.connection_pool.get_connection("_")
+                    self.connection = await self.connection_pool.get_connection()
+
+            self._event_dispatcher.dispatch(
+                AfterSingleConnectionInstantiationEvent(
+                    self.connection, ClientType.ASYNC, self._single_conn_lock
+                )
+            )
         return self
 
     def set_response_callback(self, command: str, callback: ResponseCallbackT):
@@ -446,6 +483,7 @@ class Redis(
         blocking_timeout: Optional[float] = None,
         lock_class: Optional[Type[Lock]] = None,
         thread_local: bool = True,
+        raise_on_release_error: bool = True,
     ) -> Lock:
         """
         Return a new Lock object using key ``name`` that mimics
@@ -492,6 +530,11 @@ class Redis(
                      thread-1 would see the token value as "xyz" and would be
                      able to successfully release the thread-2's lock.
 
+        ``raise_on_release_error`` indicates whether to raise an exception when
+        the lock is no longer owned when exiting the context manager. By default,
+        this is True, meaning an exception will be raised. If False, the warning
+        will be logged and the exception will be suppressed.
+
         In some use cases it's necessary to disable thread local storage. For
         example, if you have code where one thread acquires a lock and passes
         that lock instance to a worker thread to release later. If thread
@@ -509,6 +552,7 @@ class Redis(
             blocking=blocking,
             blocking_timeout=blocking_timeout,
             thread_local=thread_local,
+            raise_on_release_error=raise_on_release_error,
         )
 
     def pubsub(self, **kwargs) -> "PubSub":
@@ -517,7 +561,9 @@ class Redis(
         subscribe to channels and listen for messages that get published to
         them.
         """
-        return PubSub(self.connection_pool, **kwargs)
+        return PubSub(
+            self.connection_pool, event_dispatcher=self._event_dispatcher, **kwargs
+        )
 
     def monitor(self) -> "Monitor":
         return Monitor(self.connection_pool)
@@ -555,10 +601,12 @@ class Redis(
         """
         Closes Redis client connection
 
-        :param close_connection_pool: decides whether to close the connection pool used
-        by this Redis client, overriding Redis.auto_close_connection_pool. By default,
-        let Redis.auto_close_connection_pool decide whether to close the connection
-        pool.
+        Args:
+            close_connection_pool:
+                decides whether to close the connection pool used by this Redis client,
+                overriding Redis.auto_close_connection_pool.
+                By default, let Redis.auto_close_connection_pool decide
+                whether to close the connection pool.
         """
         conn = self.connection
         if conn:
@@ -600,10 +648,9 @@ class Redis(
     async def execute_command(self, *args, **options):
         """Execute a command and return a parsed response"""
         await self.initialize()
-        options.pop("keys", None)  # the keys are used only for client side caching
         pool = self.connection_pool
         command_name = args[0]
-        conn = self.connection or await pool.get_connection(command_name, **options)
+        conn = self.connection or await pool.get_connection()
 
         if self.single_connection_client:
             await self._single_conn_lock.acquire()
@@ -637,6 +684,9 @@ class Redis(
 
         if EMPTY_RESPONSE in options:
             options.pop(EMPTY_RESPONSE)
+
+        # Remove keys entry, it needs only for cache.
+        options.pop("keys", None)
 
         if command_name in self.response_callbacks:
             # Mypy bug: https://github.com/python/mypy/issues/10977
@@ -674,7 +724,7 @@ class Monitor:
 
     async def connect(self):
         if self.connection is None:
-            self.connection = await self.connection_pool.get_connection("MONITOR")
+            self.connection = await self.connection_pool.get_connection()
 
     async def __aenter__(self):
         await self.connect()
@@ -751,7 +801,12 @@ class PubSub:
         ignore_subscribe_messages: bool = False,
         encoder=None,
         push_handler_func: Optional[Callable] = None,
+        event_dispatcher: Optional["EventDispatcher"] = None,
     ):
+        if event_dispatcher is None:
+            self._event_dispatcher = EventDispatcher()
+        else:
+            self._event_dispatcher = event_dispatcher
         self.connection_pool = connection_pool
         self.shard_hint = shard_hint
         self.ignore_subscribe_messages = ignore_subscribe_messages
@@ -857,25 +912,33 @@ class PubSub:
         Ensure that the PubSub is connected
         """
         if self.connection is None:
-            self.connection = await self.connection_pool.get_connection(
-                "pubsub", self.shard_hint
-            )
+            self.connection = await self.connection_pool.get_connection()
             # register a callback that re-subscribes to any channels we
             # were listening to when we were disconnected
             self.connection.register_connect_callback(self.on_connect)
         else:
             await self.connection.connect()
         if self.push_handler_func is not None and not HIREDIS_AVAILABLE:
-            self.connection._parser.set_push_handler(self.push_handler_func)
+            self.connection._parser.set_pubsub_push_handler(self.push_handler_func)
+
+        self._event_dispatcher.dispatch(
+            AfterPubSubConnectionInstantiationEvent(
+                self.connection, self.connection_pool, ClientType.ASYNC, self._lock
+            )
+        )
 
     async def _disconnect_raise_connect(self, conn, error):
         """
         Close the connection and raise an exception
-        if retry_on_timeout is not set or the error
-        is not a TimeoutError. Otherwise, try to reconnect
+        if retry_on_error is not set or the error is not one
+        of the specified error types. Otherwise, try to
+        reconnect
         """
         await conn.disconnect()
-        if not (conn.retry_on_timeout and isinstance(error, TimeoutError)):
+        if (
+            conn.retry_on_error is None
+            or isinstance(error, tuple(conn.retry_on_error)) is False
+        ):
             raise error
         await conn.connect()
 
@@ -1158,13 +1221,11 @@ class PubSub:
 
 
 class PubsubWorkerExceptionHandler(Protocol):
-    def __call__(self, e: BaseException, pubsub: PubSub):
-        ...
+    def __call__(self, e: BaseException, pubsub: PubSub): ...
 
 
 class AsyncPubsubWorkerExceptionHandler(Protocol):
-    async def __call__(self, e: BaseException, pubsub: PubSub):
-        ...
+    async def __call__(self, e: BaseException, pubsub: PubSub): ...
 
 
 PSWorkerThreadExcHandlerT = Union[
@@ -1279,7 +1340,6 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
     def execute_command(
         self, *args, **kwargs
     ) -> Union["Pipeline", Awaitable["Pipeline"]]:
-        kwargs.pop("keys", None)  # the keys are used only for client side caching
         if (self.watching or args[0] == "WATCH") and not self.explicit_transaction:
             return self.immediate_execute_command(*args, **kwargs)
         return self.pipeline_execute_command(*args, **kwargs)
@@ -1288,8 +1348,8 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         """
         Close the connection, reset watching state and
         raise an exception if we were watching,
-        retry_on_timeout is not set,
-        or the error is not a TimeoutError
+        if retry_on_error is not set or the error is not one
+        of the specified error types.
         """
         await conn.disconnect()
         # if we were already watching a variable, the watch is no longer
@@ -1300,9 +1360,12 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             raise WatchError(
                 "A ConnectionError occurred on while watching one or more keys"
             )
-        # if retry_on_timeout is not set, or the error is not
-        # a TimeoutError, raise it
-        if not (conn.retry_on_timeout and isinstance(error, TimeoutError)):
+        # if retry_on_error is not set or the error is not one
+        # of the specified error types, raise it
+        if (
+            conn.retry_on_error is None
+            or isinstance(error, tuple(conn.retry_on_error)) is False
+        ):
             await self.aclose()
             raise
 
@@ -1317,9 +1380,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
         conn = self.connection
         # if this is the first call, we need a connection
         if not conn:
-            conn = await self.connection_pool.get_connection(
-                command_name, self.shard_hint
-            )
+            conn = await self.connection_pool.get_connection()
             self.connection = conn
 
         return await conn.retry.call_with_retry(
@@ -1411,6 +1472,10 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             if not isinstance(r, Exception):
                 args, options = cmd
                 command_name = args[0]
+
+                # Remove keys entry, it needs only for cache.
+                options.pop("keys", None)
+
                 if command_name in self.response_callbacks:
                     r = self.response_callbacks[command_name](r, **options)
                     if inspect.isawaitable(r):
@@ -1477,8 +1542,8 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
     async def _disconnect_raise_reset(self, conn: Connection, error: Exception):
         """
         Close the connection, raise an exception if we were watching,
-        and raise an exception if retry_on_timeout is not set,
-        or the error is not a TimeoutError
+        and raise an exception if retry_on_error is not set or the
+        error is not one of the specified error types.
         """
         await conn.disconnect()
         # if we were watching a variable, the watch is no longer valid
@@ -1488,13 +1553,16 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
             raise WatchError(
                 "A ConnectionError occurred on while watching one or more keys"
             )
-        # if retry_on_timeout is not set, or the error is not
-        # a TimeoutError, raise it
-        if not (conn.retry_on_timeout and isinstance(error, TimeoutError)):
+        # if retry_on_error is not set or the error is not one
+        # of the specified error types, raise it
+        if (
+            conn.retry_on_error is None
+            or isinstance(error, tuple(conn.retry_on_error)) is False
+        ):
             await self.reset()
             raise
 
-    async def execute(self, raise_on_error: bool = True):
+    async def execute(self, raise_on_error: bool = True) -> List[Any]:
         """Execute all the commands in the current pipeline"""
         stack = self.command_stack
         if not stack and not self.watching:
@@ -1508,7 +1576,7 @@ class Pipeline(Redis):  # lgtm [py/init-calls-subclass]
 
         conn = self.connection
         if not conn:
-            conn = await self.connection_pool.get_connection("MULTI", self.shard_hint)
+            conn = await self.connection_pool.get_connection()
             # assign to self.connection so reset() releases the connection
             # back to the pool after we're done
             self.connection = conn

@@ -121,7 +121,9 @@ class JSONCommands:
         """  # noqa
         return self.execute_command("JSON.OBJKEYS", name, str(path), keys=[name])
 
-    def objlen(self, name: str, path: Optional[str] = Path.root_path()) -> int:
+    def objlen(
+        self, name: str, path: Optional[str] = Path.root_path()
+    ) -> List[Optional[int]]:
         """Return the length of the dictionary JSON value under ``path`` at key
         ``name``.
 
@@ -312,7 +314,7 @@ class JSONCommands:
 
         """
 
-        with open(file_name, "r") as fp:
+        with open(file_name) as fp:
             file_content = loads(fp.read())
 
         return self.set(name, path, file_content, nx=nx, xx=xx, decode_keys=decode_keys)
